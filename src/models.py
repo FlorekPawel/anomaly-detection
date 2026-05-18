@@ -5,7 +5,6 @@ from typing import ClassVar
 
 from pyod.models.pca import PCA
 from sklearn.cluster import DBSCAN
-from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
@@ -38,8 +37,11 @@ class AnomalyDetectorFactory:
         "local_outlier_factor": ModelSpec(
             name="LocalOutlierFactor",
             family="density",
-            model=LocalOutlierFactor(novelty=True),
-            param_grid={"n_neighbors": [10, 20, 50, 100]},
+            model=LocalOutlierFactor(novelty=False),
+            param_grid={
+                "n_neighbors": [10, 20, 50, 100],
+                "contamination": [0.05, 0.1, 0.2],
+            },
         ),
         "one_class_svm": ModelSpec(
             name="OneClassSVM",
@@ -54,19 +56,16 @@ class AnomalyDetectorFactory:
             name="DBSCAN",
             family="cluster",
             model=DBSCAN(),
-            param_grid={"eps": [0.1, 0.5, 1.0, 2.0], "min_samples": [5, 10, 20]},
+            param_grid={
+                "eps": [0.5, 1.0, 2.0, 4.0, 6.0],
+                "min_samples": [5, 10, 20],
+            },
         ),
         "pca": ModelSpec(
             name="PCA",
-            family="projection",
-            model=PCA(),
+            family="decomposition",
+            model=PCA(contamination=0.1),
             param_grid={"n_components": [0.5, 0.7, 0.9, 0.95]},
-        ),
-        "elliptic_envelope": ModelSpec(
-            name="EllipticEnvelope",
-            family="statistical",
-            model=EllipticEnvelope(random_state=42),
-            param_grid={"contamination": [0.01, 0.05, 0.1, 0.2]},
         ),
     }
 

@@ -6,6 +6,7 @@ help:
 	@echo "  make clean                  - Clean virtual environment and lockfile"
 	@echo "  make test                   - Run tests"
 	@echo "  make run                    - Run main pipeline"
+	@echo "  make mlflow                 - Start MLflow UI (http://localhost:5000)"
 	@echo "  make pre-commit             - Run pre-commit checks on changed files"
 	@echo "  make pre-commit-all         - Run pre-commit checks on all files"
 
@@ -29,6 +30,10 @@ test::
 # run main pipeline
 run:
 	uv run python -m src.main
+
+# start MLflow UI
+mlflow:
+	uv run mlflow ui
 
 # pre-commit checks on changed files only
 pre-commit:

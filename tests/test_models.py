@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 from pyod.models.pca import PCA
 from sklearn.cluster import DBSCAN
-from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
@@ -22,7 +21,10 @@ from src.models import AnomalyDetectorFactory
         (
             "local_outlier_factor",
             LocalOutlierFactor,
-            {"n_neighbors": [10, 20, 50, 100]},
+            {
+                "n_neighbors": [10, 20, 50, 100],
+                "contamination": [0.05, 0.1, 0.2],
+            },
         ),
         (
             "one_class_svm",
@@ -32,17 +34,15 @@ from src.models import AnomalyDetectorFactory
         (
             "dbscan",
             DBSCAN,
-            {"eps": [0.1, 0.5, 1.0, 2.0], "min_samples": [5, 10, 20]},
+            {
+                "eps": [0.5, 1.0, 2.0, 4.0, 6.0],
+                "min_samples": [5, 10, 20],
+            },
         ),
         (
             "pca",
             PCA,
             {"n_components": [0.5, 0.7, 0.9, 0.95]},
-        ),
-        (
-            "elliptic_envelope",
-            EllipticEnvelope,
-            {"contamination": [0.01, 0.05, 0.1, 0.2]},
         ),
     ],
 )

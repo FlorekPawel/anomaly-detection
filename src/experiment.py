@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -12,6 +13,7 @@ import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
+from sklearn.exceptions import NotFittedError
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -37,30 +39,85 @@ class RunSummary:
 
 
 def _params_hash(params: dict[str, Any]) -> str:
-    payload = json.dumps(params, sort_keys=True, default=str)
-    return str(abs(hash(payload)))
+    """Return a stable hash of a params dict (survives process restarts)."""
+    payload = json.dumps(params, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _normalize_labels(labels: np.ndarray) -> np.ndarray:
+    """Map outlier-detector outputs to the unified {0=inlier, 1=outlier} convention.
+
+    - sklearn detectors (IsolationForest, OneClassSVM, LocalOutlierFactor): -1 = outlier
+    - DBSCAN: -1 = noise (outlier), >=0 = cluster member (inlier)
+    - pyod / already-binary: leave as-is
+    """
+    arr = np.asarray(labels)
+    if arr.dtype.kind in {"i", "b"} and set(np.unique(arr).tolist()) <= {0, 1}:
+        return arr.astype(int)
+    return np.where(arr == -1, 1, 0).astype(int)
+
+
+def _fit_and_predict_raw(model: Any, features: np.ndarray) -> np.ndarray:
+    """Fit ``model`` on ``features`` and return the raw label array.
+
+    Avoids ``fit_predict`` on pyod detectors (it inherits the deprecated sklearn
+    ``OutlierMixin.fit_predict``); pyod exposes ``predict`` after ``fit`` directly.
+    For sklearn detectors and DBSCAN, ``fit_predict`` is the canonical API.
+    """
+    cls_module = getattr(type(model), "__module__", "") or ""
+    if cls_module.startswith("pyod"):
+        model.fit(features)
+        return np.asarray(model.predict(features))
+    if hasattr(model, "fit_predict"):
+        return np.asarray(model.fit_predict(features))
+    model.fit(features)
+    return np.asarray(model.predict(features))
 
 
 def _predict_outliers(model: Any, features: np.ndarray) -> np.ndarray:
-    if hasattr(model, "fit_predict"):
-        labels = model.fit_predict(features)
-        return np.where(labels == -1, 1, 0)
+    """Get binary outlier predictions from a fitted model."""
+    if hasattr(model, "labels_"):
+        return _normalize_labels(model.labels_)
+    if hasattr(model, "predict"):
+        try:
+            return _normalize_labels(model.predict(features))
+        except (AttributeError, NotFittedError, ValueError):
+            pass
+    return _normalize_labels(model.fit_predict(features))
 
-    labels = model.predict(features)
-    if labels.dtype.kind in {"i", "b"} and set(np.unique(labels)) <= {0, 1}:
-        return labels.astype(int)
 
-    return np.where(labels == -1, 1, 0)
+def _outlier_scores(model: Any, features: np.ndarray) -> np.ndarray | None:
+    """Return scores oriented so that *higher = more anomalous*.
+
+    sklearn outlier detectors return higher = more *normal*; we negate them.
+    pyod detectors already return higher = more *anomalous*; we pass them through.
+    """
+    cls_module = getattr(type(model), "__module__", "") or ""
+    is_pyod = cls_module.startswith("pyod")
+
+    if hasattr(model, "decision_function"):
+        try:
+            scores = np.asarray(model.decision_function(features), dtype=float)
+            return scores if is_pyod else -scores
+        except (AttributeError, NotFittedError, ValueError):
+            pass
+    if hasattr(model, "decision_scores_"):
+        return np.asarray(model.decision_scores_, dtype=float)
+    if hasattr(model, "score_samples"):
+        try:
+            return -np.asarray(model.score_samples(features), dtype=float)
+        except (AttributeError, NotFittedError, ValueError):
+            pass
+    if hasattr(model, "negative_outlier_factor_"):
+        nof = np.asarray(model.negative_outlier_factor_, dtype=float)
+        if len(nof) == len(features):
+            return -nof
+    return None
 
 
 def _decision_scores(model: Any, features: np.ndarray) -> np.ndarray | None:
-    if hasattr(model, "decision_function"):
-        return model.decision_function(features)
-    if hasattr(model, "score_samples"):
-        return model.score_samples(features)
-    if hasattr(model, "decision_scores_"):
-        return model.decision_scores_
-    return None
+    """Backward-compatible alias for ``_outlier_scores``."""
+    return _outlier_scores(model, features)
 
 
 def _compute_metrics(
@@ -92,7 +149,7 @@ class ExperimentRunner:
         seeds: list[int] | None = None,
     ):
         self.experiment_name = experiment_name
-        self.seeds = seeds if seeds is not None else [42, 43, 44]
+        self.seeds = seeds if seeds is not None else [0, 42, 3407]
         os.environ.setdefault("MLFLOW_DISABLE_ENVIRONMENT_INFERENCE", "1")
         for logger_name in ["mlflow", "mlflow.utils", "mlflow.sklearn", "urllib3.connectionpool"]:
             logging.getLogger(logger_name).setLevel(logging.ERROR)
@@ -145,10 +202,10 @@ class ExperimentRunner:
 
                 model = clone(model_spec.model)
                 model.set_params(**run_params)
-                model.fit(features)
 
-                predictions = _predict_outliers(model, features)
-                scores = _decision_scores(model, features)
+                raw_predictions = _fit_and_predict_raw(model, features)
+                predictions = _normalize_labels(raw_predictions)
+                scores = _outlier_scores(model, features)
                 metrics = _compute_metrics(labels, predictions, scores)
 
                 with mlflow.start_run(run_name=f"{dataset}-{model_spec.name}") as run:
@@ -158,7 +215,6 @@ class ExperimentRunner:
                     mlflow.set_tag("model_factory_key", model_spec.factory_key)
                     mlflow.set_tag("family", model_spec.family)
                     mlflow.set_tag("params_hash", _params_hash(run_params))
-                    mlflow.sklearn.log_model(model, name="model")
                     run_ids.append(run.info.run_id)
 
         return run_ids
@@ -225,6 +281,87 @@ class ExperimentRunner:
                 )
             )
 
+        return summaries
+
+    def get_aggregate_best_per_model_on_subset(
+        self,
+        metric: str = "f1_score",
+        dataset_prefix: str | None = "odds_",
+        seed_param: str = "params.random_state",
+    ) -> list[RunSummary]:
+        """Pick, per model family, the hyperparameter configuration with the best *mean* metric.
+
+        Selection averages the metric across all matching datasets and seeds (the seed
+        parameter is excluded from the params key, so it does not split groups).
+
+        Parameters
+        ----------
+        metric:
+            Metric name without the ``metrics.`` prefix (default ``"f1_score"``).
+        dataset_prefix:
+            Restrict aggregation to runs whose ``tags.dataset`` starts with this prefix
+            (default ``"odds_"`` — real-world tabular benchmarks closest in shape to a
+            typical verification set). Pass ``None`` to aggregate over every dataset.
+            If the filter would discard all runs, the full set is used as a fallback.
+        seed_param:
+            Name of the seed parameter column to exclude from the params identity.
+        """
+        experiment = mlflow.get_experiment_by_name(self.experiment_name)
+        if experiment is None:
+            return []
+
+        runs = mlflow.search_runs([experiment.experiment_id])
+        metric_col = f"metrics.{metric}"
+        if runs.empty or metric_col not in runs.columns:
+            return []
+
+        df = runs.copy()
+        if dataset_prefix is not None and "tags.dataset" in df.columns:
+            filtered = df[df["tags.dataset"].astype(str).str.startswith(dataset_prefix)]
+            if not filtered.empty:
+                df = filtered
+
+        df = df.dropna(subset=[metric_col])
+        if df.empty:
+            return []
+
+        param_cols = [c for c in df.columns if c.startswith("params.") and c != seed_param]
+        df["_params_key"] = (
+            df[param_cols].astype(str).fillna("").agg("|".join, axis=1) if param_cols else ""
+        )
+
+        agg = df.groupby(["tags.model_factory_key", "_params_key"], as_index=False).agg(
+            mean_metric=(metric_col, "mean"),
+            n_runs=(metric_col, "size"),
+            n_datasets=("tags.dataset", pd.Series.nunique),
+        )
+        best = (
+            agg.sort_values("mean_metric", ascending=False)
+            .groupby("tags.model_factory_key", as_index=False)
+            .head(1)
+        )
+
+        summaries: list[RunSummary] = []
+        for _, row in best.iterrows():
+            sample = df[
+                (df["tags.model_factory_key"] == row["tags.model_factory_key"])
+                & (df["_params_key"] == row["_params_key"])
+            ].iloc[0]
+            params_filtered = {
+                k: v
+                for k, v in sample.filter(like="params.").to_dict().items()
+                if pd.notna(v) and k != seed_param
+            }
+            params_typed = self._convert_param_types(params_filtered)
+            summaries.append(
+                RunSummary(
+                    family=sample.get("tags.family", ""),
+                    model_name=sample["tags.model_factory_key"],
+                    run_id=sample["run_id"],
+                    metrics={metric: float(row["mean_metric"])},
+                    params=params_typed,
+                )
+            )
         return summaries
 
     @staticmethod

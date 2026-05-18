@@ -16,4 +16,4 @@ class EnsembleDetector:
         stacked = np.vstack(predictions)
         votes = stacked.sum(axis=0)
         threshold = len(predictions) / 2.0
-        return (votes > threshold).astype(int)
+        return (votes >= threshold).astype(int)
